@@ -1,0 +1,110 @@
+"""
+Premier_League_Scraper.py
+--------------------------
+Scrapes the 2023-24 Premier League standings table from Wikipedia
+and saves it as 'Premier_League_Table.csv'.
+
+Fix summary vs. the user's snippet
+------------------------------------
+1. io.StringIO   — correct; kept as-is. Pandas >= 2.0 requires it.
+2. dfs[3]        — FRAGILE. Wikipedia adds/removes tables across edits,
+                   so index 3 may not be the standings tomorrow.
+                   Replaced with a search for the table containing a 'Pos' column.
+
+Dependencies:
+    pip install requests pandas lxml
+"""
+
+import io                            # Wraps a plain string so Pandas can treat it like a file
+import requests                      # Downloads the raw HTML from Wikipedia
+import pandas as pd                  # Parses HTML tables and exports to CSV
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+URL = "https://en.wikipedia.org/wiki/2023%E2%80%9324_Premier_League"
+OUTPUT_FILE = "Premier_League_Table.csv"
+
+# Mimic a real browser so Wikipedia doesn't serve a stripped-down response
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+# ── Step 1: Download the page ─────────────────────────────────────────────────
+
+print(f"Fetching: {URL}")
+response = requests.get(URL, headers=HEADERS, timeout=15)
+response.raise_for_status()         # Immediately raises an error on 4xx / 5xx responses
+print(f"HTTP {response.status_code} — OK")
+
+# ── Step 2: Parse every table on the page ─────────────────────────────────────
+
+html_content = response.text        # The full HTML string (starts with <!DOCTYPE html>)
+
+# io.StringIO wraps the string in a file-like object.
+# pd.read_html() expects a file or URL; without StringIO, Pandas 2.x raises a TypeError.
+dfs = pd.read_html(io.StringIO(html_content), flavor="lxml")
+# Returns a LIST of DataFrames — one per <table> found on the page.
+
+print(f"{len(dfs)} table(s) found on the page.")
+
+# ── Step 3: Find the league standings table safely ────────────────────────────
+#
+# WHY NOT dfs[3]?
+#   Wikipedia pages change — editors add info-boxes, hatnote tables, or
+#   season-summary panels.  The standings table's position in the list shifts
+#   whenever the page is edited, so a hardcoded index breaks silently
+#   (you get the wrong table, no error).
+#
+# BETTER: search for the table that contains a "Pos" column, which is unique
+#   to a football-standings table and stable across page edits.
+
+league_table = None                  # Will hold the DataFrame we want
+
+for i, df in enumerate(dfs):        # Iterate with an index so we can log which one we picked
+    # Flatten multi-level column headers that Wikipedia sometimes generates
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [" ".join(str(s) for s in col).strip() for col in df.columns]
+
+    # Normalise to strings and strip whitespace before comparing
+    col_names = [str(c).strip() for c in df.columns]
+
+    if "Pos" in col_names:          # "Pos" appears in every football league standings table
+        league_table = df
+        print(f"League table identified at index {i} ✓  (columns: {col_names})")
+        break                       # Stop at the first match
+
+if league_table is None:
+    # Print all table shapes to help the developer debug manually
+    for i, df in enumerate(dfs):
+        print(f"  Table {i}: shape={df.shape}, cols={list(df.columns)[:6]}")
+    raise ValueError(
+        "No table with a 'Pos' column was found. "
+        "Wikipedia's layout may have changed — check the debug output above."
+    )
+
+# ── Step 4: Clean ─────────────────────────────────────────────────────────────
+
+league_table.replace("", pd.NA, inplace=True)   # Empty strings → NaN
+league_table.dropna(how="all", inplace=True)    # Drop rows that are entirely empty
+league_table.reset_index(drop=True, inplace=True)  # Re-number index after drops
+
+# Strip Wikipedia footnote markers, e.g. "Pts[a]" → "Pts"
+league_table.columns = [str(c).split("[")[0].strip() for c in league_table.columns]
+
+# ── Step 5: Preview ───────────────────────────────────────────────────────────
+
+print(f"\nFinal shape: {league_table.shape}")
+print("\n── First 5 rows ──────────────────────────────────────")
+print(league_table.head().to_string(index=False))
+print("──────────────────────────────────────────────────────\n")
+
+# ── Step 6: Save ──────────────────────────────────────────────────────────────
+
+league_table.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+# utf-8-sig adds a BOM so Excel opens the file without garbling special characters
+
+print(f"✓ Saved → '{OUTPUT_FILE}'")
